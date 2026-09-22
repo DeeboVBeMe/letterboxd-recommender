@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Letterboxd Movie Recommender — Streamlit Web Version (Fixed)
+Letterboxd Movie Recommender — Streamlit Web Version
+With richer recommendation explanations.
 """
 
 from __future__ import annotations
@@ -42,8 +43,33 @@ class Recommendation:
     tmdb_id: int
     score: float
     reasons: list[str]
+    explanation: str = ""
     tmdb_vote: Optional[float] = None
     overview: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def safe_get(obj, key, default=None):
+    try:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+    except Exception:
+        return default
+
+
+def to_list(obj):
+    if obj is None:
+        return []
+    try:
+        return list(obj)
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -85,32 +111,6 @@ def load_from_csv(uploaded_file) -> list[RatedFilm]:
         except (ValueError, TypeError):
             continue
     return films
-
-
-# ---------------------------------------------------------------------------
-# Helper to safely turn tmdbv3api objects into plain data
-# ---------------------------------------------------------------------------
-
-def safe_get(obj, key, default=None):
-    """Safely get a value from either a dict or an object."""
-    try:
-        if obj is None:
-            return default
-        if isinstance(obj, dict):
-            return obj.get(key, default)
-        return getattr(obj, key, default)
-    except Exception:
-        return default
-
-
-def to_list(obj):
-    """Force something into a normal Python list."""
-    if obj is None:
-        return []
-    try:
-        return list(obj)
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -166,26 +166,21 @@ class TMDBClient:
             m = self.movie.details(tmdb_id)
             credits = self.movie.credits(tmdb_id)
 
-            # --- Genres ---
             genres = []
             for g in to_list(safe_get(m, "genres")):
                 name = safe_get(g, "name")
                 if name:
                     genres.append(name)
 
-            # --- Directors ---
             directors = []
-            crew = to_list(safe_get(credits, "crew"))
-            for c in crew:
+            for c in to_list(safe_get(credits, "crew")):
                 if safe_get(c, "job") == "Director":
                     name = safe_get(c, "name")
                     if name:
                         directors.append(name)
 
-            # --- Actors (top 8) ---
             actors = []
-            cast = to_list(safe_get(credits, "cast"))
-            for c in cast[:8]:
+            for c in to_list(safe_get(credits, "cast"))[:8]:
                 name = safe_get(c, "name")
                 if name:
                     actors.append(name)
@@ -276,23 +271,18 @@ class TMDBClient:
 
 
 # ---------------------------------------------------------------------------
-# Analysis helpers
+# Analysis + richer explanations
 # ---------------------------------------------------------------------------
 
 def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 40) -> list[RatedFilm]:
     ranked = sorted(films, key=lambda f: f.user_rating, reverse=True)[:max_enrich]
-
-    st.write("### Looking up movies on TMDB...")
     progress = st.progress(0)
     status_text = st.empty()
-
     success_count = 0
-    fail_count = 0
 
     for i, film in enumerate(ranked):
         status_text.text(f"Looking up: {film.title}")
         result = tmdb.search_movie(film.title, film.year)
-
         if result and result.get("id"):
             film.tmdb_id = result["id"]
             details = tmdb.get_details(result["id"])
@@ -303,17 +293,12 @@ def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 40)
                 if film.letterboxd_avg is None and details.get("vote_average"):
                     film.letterboxd_avg = round(details["vote_average"] / 2, 2)
                 success_count += 1
-            else:
-                fail_count += 1
-        else:
-            fail_count += 1
-
         progress.progress((i + 1) / len(ranked))
         time.sleep(0.03)
 
     progress.empty()
     status_text.empty()
-    st.info(f"Matched **{success_count}** films successfully ({fail_count} failed)")
+    st.info(f"Matched **{success_count}** films to TMDB")
     return films
 
 
@@ -353,6 +338,62 @@ def analyze_preferences(films: list[RatedFilm], min_rating: float = 4.0) -> dict
     }
 
 
+def build_explanation(
+    title: str,
+    reasons: list[str],
+    seed_titles: list[str],
+    top_genres: list[str],
+    top_directors: list[str],
+    tmdb_vote: Optional[float],
+) -> str:
+    """Turn raw signals into a short 2–3 sentence explanation."""
+    parts = []
+
+    # Similarity / seed films
+    similar_seeds = [r for r in reasons if r.startswith("Similar to your")]
+    if similar_seeds:
+        # Extract the movie names from the reason strings
+        named = []
+        for r in similar_seeds[:2]:
+            # format: "Similar to your 5.0★ Movie Title"
+            if "★ " in r:
+                named.append(r.split("★ ", 1)[1])
+        if named:
+            if len(named) == 1:
+                parts.append(f"It shares a strong stylistic or thematic connection with *{named[0]}*, which you rated very highly.")
+            else:
+                parts.append(f"It sits close to films you loved such as *{named[0]}* and *{named[1]}*.")
+
+    # Director
+    dir_reasons = [r for r in reasons if r.startswith("Directed by")]
+    if dir_reasons:
+        dname = dir_reasons[0].replace("Directed by ", "")
+        parts.append(f"It is directed by **{dname}**, one of the filmmakers who appears most often among your highest-rated movies.")
+
+    # Genre
+    genre_reasons = [r for r in reasons if "preferred genres" in r.lower() or "Matches preferred" in r]
+    if genre_reasons and top_genres:
+        gshow = ", ".join(top_genres[:2])
+        parts.append(f"It falls squarely in your favorite territory ({gshow}).")
+
+    # Community quality
+    if tmdb_vote and tmdb_vote >= 7.8:
+        parts.append(f"It also carries a strong critical reputation (TMDB {tmdb_vote:.1f}/10).")
+    elif tmdb_vote and tmdb_vote >= 7.2:
+        parts.append(f"Critics and audiences rate it solidly (TMDB {tmdb_vote:.1f}/10).")
+
+    # Fallback if we somehow have almost nothing
+    if not parts:
+        if seed_titles:
+            parts.append(f"It was recommended because of its closeness to films you already rate highly, such as *{seed_titles[0]}*.")
+        else:
+            parts.append("It matches several patterns in your highest-rated films.")
+
+    # Keep it to roughly 2–3 sentences
+    text = " ".join(parts[:3])
+    return text
+
+
 def generate_recommendations(
     films: list[RatedFilm],
     prefs: dict[str, Any],
@@ -362,7 +403,10 @@ def generate_recommendations(
     already_seen = {f.title.lower() for f in films}
     candidates: dict[int, Recommendation] = {}
 
-    def add_candidate(item: dict, base_score: float, reason: str):
+    # Keep track of which of the user's films triggered each candidate
+    seed_map: dict[int, list[str]] = {}
+
+    def add_candidate(item: dict, base_score: float, reason: str, seed_title: str = ""):
         tid = item.get("id")
         title = item.get("title")
         if not tid or not title or title.lower() in already_seen:
@@ -371,6 +415,8 @@ def generate_recommendations(
             candidates[tid].score += base_score
             if reason not in candidates[tid].reasons:
                 candidates[tid].reasons.append(reason)
+            if seed_title and seed_title not in seed_map.get(tid, []):
+                seed_map.setdefault(tid, []).append(seed_title)
         else:
             candidates[tid] = Recommendation(
                 title=title,
@@ -381,28 +427,42 @@ def generate_recommendations(
                 tmdb_vote=item.get("vote_average"),
                 overview=item.get("overview"),
             )
+            if seed_title:
+                seed_map[tid] = [seed_title]
 
     high = prefs["high_rated"][:12]
+    top_genre_names = [g for g, _ in prefs["top_genres"][:3]]
+    top_director_names = [d for d, _ in prefs["top_directors"][:4]]
 
     for f in high:
         if not f.tmdb_id:
             continue
         for sim in tmdb.get_similar(f.tmdb_id, limit=6):
-            add_candidate(sim, 3.0 * (f.user_rating / 5), f"Similar to your {f.user_rating}★ {f.title}")
+            add_candidate(
+                sim,
+                3.0 * (f.user_rating / 5),
+                f"Similar to your {f.user_rating}★ {f.title}",
+                seed_title=f.title,
+            )
         for rec in tmdb.get_recommendations(f.tmdb_id, limit=4):
-            add_candidate(rec, 2.5 * (f.user_rating / 5), f"Recommended alongside {f.title}")
+            add_candidate(
+                rec,
+                2.5 * (f.user_rating / 5),
+                f"Recommended alongside {f.title}",
+                seed_title=f.title,
+            )
 
     genre_map = tmdb.genre_name_to_id()
-    top_genre_ids = [genre_map[g] for g, _ in prefs["top_genres"][:3] if g in genre_map]
+    top_genre_ids = [genre_map[g] for g in top_genre_names if g in genre_map]
     if top_genre_ids:
         for disco in tmdb.discover_by(top_genre_ids, limit=12):
             add_candidate(
                 disco,
                 2.0,
-                f"Matches preferred genres ({', '.join(g for g, _ in prefs['top_genres'][:3])})",
+                f"Matches preferred genres ({', '.join(top_genre_names)})",
             )
 
-    for dname, _ in prefs["top_directors"][:4]:
+    for dname in top_director_names:
         try:
             person_search = to_list(tmdb.search.people(dname))
             if person_search:
@@ -428,6 +488,18 @@ def generate_recommendations(
             rec.score += 0.8
             rec.reasons.append("High TMDB rating")
 
+    # Build natural-language explanations
+    for tid, rec in candidates.items():
+        seeds = seed_map.get(tid, [])
+        rec.explanation = build_explanation(
+            title=rec.title,
+            reasons=rec.reasons,
+            seed_titles=seeds,
+            top_genres=top_genre_names,
+            top_directors=top_director_names,
+            tmdb_vote=rec.tmdb_vote,
+        )
+
     ranked = sorted(candidates.values(), key=lambda r: r.score, reverse=True)
     return ranked[:top_n]
 
@@ -444,8 +516,7 @@ st.set_page_config(
 
 st.title("🎬 Letterboxd Movie Recommender")
 st.markdown(
-    "Analyze your Letterboxd ratings and get personalized movie recommendations.\n\n"
-    "**How to use:** Upload a CSV of your ratings + paste your TMDB API key, then click the button."
+    "Analyze your Letterboxd ratings and get personalized movie recommendations."
 )
 
 with st.sidebar:
@@ -455,7 +526,7 @@ with st.sidebar:
         type="password",
         help="Get a free key at themoviedb.org/settings/api",
     )
-    top_n = st.slider("Number of recommendations", 5, 30, 15)
+    top_n = st.slider("Number of recommendations", 5, 30, 12)
     min_rating = st.slider("Min rating for favorites", 3.0, 5.0, 4.0, 0.5)
 
 st.subheader("Your Ratings")
@@ -499,7 +570,7 @@ if run_button:
 
     matched = [f for f in films if f.genres or f.directors]
     if len(matched) == 0:
-        st.error("No films could be matched to TMDB. Please check your API key and try again.")
+        st.error("No films could be matched to TMDB. Please check your API key.")
         st.stop()
 
     with st.spinner("Analyzing your taste..."):
@@ -522,7 +593,7 @@ if run_button:
         st.markdown("**Favorite Genres**")
         if prefs["top_genres"]:
             for g, s in prefs["top_genres"]:
-                st.write(f"• {g} ({s:.1f})")
+                st.write(f"• {g}")
         else:
             st.write("_None found_")
 
@@ -541,30 +612,21 @@ if run_button:
         else:
             st.write("_None found_")
 
-        if prefs["overrated_by_user"]:
-            st.markdown("**Films you love more than the crowd**")
-            for f in prefs["overrated_by_user"][:5]:
-                st.write(f"• {f.title} ({f.year or '?'}) — you {f.user_rating}★")
-
     st.divider()
     st.subheader("Recommended Movies")
+    st.caption("Score is only used for ranking — higher means a stronger match to your taste.")
 
     if not recs:
         st.warning("No recommendations could be generated.")
     else:
-        table_data = []
         for i, r in enumerate(recs, 1):
-            reasons = "; ".join(r.reasons[:2])
-            if len(r.reasons) > 2:
-                reasons += f" (+{len(r.reasons)-2} more)"
-            table_data.append({
-                "#": i,
-                "Title": r.title,
-                "Year": r.year or "—",
-                "Score": f"{r.score:.1f}",
-                "Why recommended": reasons,
-            })
-        st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+            year_str = f" ({r.year})" if r.year else ""
+            st.markdown(f"### {i}. {r.title}{year_str}")
+            st.markdown(r.explanation)
+            if r.overview:
+                with st.expander("Plot synopsis"):
+                    st.write(r.overview)
+            st.markdown("---")
 
 st.divider()
 st.caption("Upload a CSV with columns Title, Year, Rating")
