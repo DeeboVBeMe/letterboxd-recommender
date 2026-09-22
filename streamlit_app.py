@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Letterboxd Movie Recommender — Streamlit Web Version (100% Free Hosting)
+Letterboxd Movie Recommender — Streamlit Web Version (DEBUG)
+Shows detailed messages so we can see why TMDB matching fails.
 """
 
 from __future__ import annotations
@@ -88,67 +89,7 @@ def load_from_csv(uploaded_file) -> list[RatedFilm]:
 
 
 # ---------------------------------------------------------------------------
-# Scrape (best-effort)
-# ---------------------------------------------------------------------------
-
-def scrape_letterboxd(username: str) -> list[RatedFilm]:
-    try:
-        from letterboxdpy.user import User
-        user = User(username)
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not scrape @{username}.\n\n"
-            f"Error: {e}\n\n"
-            "Letterboxd often blocks cloud servers.\n"
-            "Please use the CSV upload option instead — it's much more reliable."
-        )
-
-    films: list[RatedFilm] = []
-    try:
-        raw = user.get_films()
-        items = []
-        if isinstance(raw, dict):
-            items = raw.get("films") or raw.get("items") or list(raw.values())
-        else:
-            items = list(raw) if raw else []
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            rating = item.get("rating") or item.get("user_rating") or item.get("stars")
-            if rating is None:
-                continue
-            try:
-                rating = float(rating)
-            except (TypeError, ValueError):
-                continue
-            if rating <= 0:
-                continue
-            title = item.get("name") or item.get("title") or item.get("film", {}).get("name")
-            year = item.get("year") or item.get("release_year")
-            if title:
-                films.append(
-                    RatedFilm(
-                        title=str(title),
-                        year=int(year) if year else None,
-                        user_rating=rating,
-                    )
-                )
-    except Exception:
-        pass
-
-    seen = set()
-    unique = []
-    for f in films:
-        key = (f.title.lower(), f.year)
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-    return unique
-
-
-# ---------------------------------------------------------------------------
-# TMDB client
+# TMDB client with better error reporting
 # ---------------------------------------------------------------------------
 
 class TMDBClient:
@@ -163,13 +104,18 @@ class TMDBClient:
         self.person_api = Person()
         self.discover = Discover()
         self._cache: dict[str, Any] = {}
+        self.last_error = None
 
     def search_movie(self, title: str, year: Optional[int] = None) -> Optional[dict]:
         key = f"search:{title}:{year}"
         if key in self._cache:
             return self._cache[key]
         try:
-            results = self.search.movies(title, year=year) if year else self.search.movies(title)
+            if year:
+                results = self.search.movies(title, year=year)
+            else:
+                results = self.search.movies(title)
+
             if results:
                 best = results[0]
                 data = {
@@ -181,10 +127,14 @@ class TMDBClient:
                 }
                 self._cache[key] = data
                 return data
-        except Exception:
-            pass
-        self._cache[key] = None
-        return None
+            else:
+                self.last_error = f"No results for '{title}'"
+                self._cache[key] = None
+                return None
+        except Exception as e:
+            self.last_error = str(e)
+            self._cache[key] = None
+            return None
 
     def get_details(self, tmdb_id: int) -> Optional[dict]:
         key = f"details:{tmdb_id}"
@@ -195,18 +145,27 @@ class TMDBClient:
             credits = self.movie.credits(tmdb_id)
             crew = credits.crew if hasattr(credits, "crew") else credits.get("crew", [])
             cast = credits.cast if hasattr(credits, "cast") else credits.get("cast", [])
+
             directors = []
             for c in crew:
                 job = c.get("job") if isinstance(c, dict) else getattr(c, "job", None)
                 name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
                 if job == "Director" and name:
                     directors.append(name)
+
             actors = []
             for c in (cast or [])[:8]:
                 name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
                 if name:
                     actors.append(name)
-            genres = [g["name"] if isinstance(g, dict) else g.name for g in (getattr(m, "genres", None) or [])]
+
+            genres = []
+            for g in (getattr(m, "genres", None) or []):
+                if isinstance(g, dict):
+                    genres.append(g["name"])
+                else:
+                    genres.append(g.name)
+
             data = {
                 "id": tmdb_id,
                 "title": m.title,
@@ -219,7 +178,8 @@ class TMDBClient:
             }
             self._cache[key] = data
             return data
-        except Exception:
+        except Exception as e:
+            self.last_error = str(e)
             self._cache[key] = None
             return None
 
@@ -291,11 +251,22 @@ class TMDBClient:
 # Analysis helpers
 # ---------------------------------------------------------------------------
 
-def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 50) -> list[RatedFilm]:
+def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 40) -> list[RatedFilm]:
     ranked = sorted(films, key=lambda f: f.user_rating, reverse=True)[:max_enrich]
-    progress = st.progress(0, text="Looking up movies on TMDB...")
+
+    st.write("### 🔍 Debug: Looking up movies on TMDB")
+    progress = st.progress(0)
+    status_text = st.empty()
+    debug_box = st.empty()
+
+    success_count = 0
+    fail_count = 0
+    debug_lines = []
+
     for i, film in enumerate(ranked):
+        status_text.text(f"Looking up: {film.title} ({film.year or '?'})")
         result = tmdb.search_movie(film.title, film.year)
+
         if result:
             film.tmdb_id = result["id"]
             details = tmdb.get_details(result["id"])
@@ -305,9 +276,24 @@ def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 50)
                 film.actors = details.get("actors", [])
                 if film.letterboxd_avg is None and details.get("vote_average"):
                     film.letterboxd_avg = round(details["vote_average"] / 2, 2)
-        progress.progress((i + 1) / len(ranked), text=f"Looking up {film.title[:40]}...")
-        time.sleep(0.04)
+                success_count += 1
+                debug_lines.append(f"✅ **{film.title}** → matched as *{details.get('title')}* | Genres: {film.genres[:3]}")
+            else:
+                fail_count += 1
+                debug_lines.append(f"⚠️ **{film.title}** → found ID {result['id']} but failed to get details. Error: {tmdb.last_error}")
+        else:
+            fail_count += 1
+            debug_lines.append(f"❌ **{film.title}** → no match. Error: {tmdb.last_error}")
+
+        progress.progress((i + 1) / len(ranked))
+        # Show only the last 12 lines so the page doesn’t get too long
+        debug_box.markdown("\n\n".join(debug_lines[-12:]))
+        time.sleep(0.05)
+
     progress.empty()
+    status_text.empty()
+
+    st.info(f"TMDB matching finished: **{success_count} succeeded**, **{fail_count} failed** out of {len(ranked)} films.")
     return films
 
 
@@ -440,18 +426,14 @@ def generate_recommendations(
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Letterboxd Movie Recommender",
+    page_title="Letterboxd Movie Recommender (Debug)",
     page_icon="🎬",
     layout="centered",
 )
 
-st.title("🎬 Letterboxd Movie Recommender")
+st.title("🎬 Letterboxd Movie Recommender (Debug Mode)")
 st.markdown(
-    "Analyze your Letterboxd ratings and get personalized movie recommendations.\n\n"
-    "**How to use:**\n"
-    "1. Get a free TMDB API key → [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)\n"
-    "2. Upload a CSV of your ratings **(recommended)** or try your Letterboxd username\n"
-    "3. Click the button"
+    "This version shows detailed messages so we can see why recommendations are empty."
 )
 
 with st.sidebar:
@@ -498,28 +480,43 @@ if run_button:
                 st.error(f"Error reading CSV:\n{e}")
                 st.stop()
         elif username and username.strip():
-            try:
-                films = scrape_letterboxd(username.strip())
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
+            st.warning("Username scraping is often blocked. Prefer CSV.")
+            st.stop()
         else:
-            st.error("Please upload a CSV or enter a Letterboxd username.")
+            st.error("Please upload a CSV.")
             st.stop()
 
-    if len(films) < 5:
-        st.error(f"Only found {len(films)} rated films. Need at least 5.")
+    if len(films) < 3:
+        st.error(f"Only found {len(films)} rated films. Need at least 3.")
         st.stop()
 
-    st.success(f"Loaded {len(films)} rated films")
+    st.success(f"Loaded **{len(films)}** rated films from CSV")
+    st.write("First few films loaded:", [f"{f.title} ({f.year}) – {f.user_rating}★" for f in films[:5]])
 
+    # Test the API key quickly
+    st.write("### Testing TMDB connection...")
     try:
         tmdb = TMDBClient(tmdb_key.strip())
+        test = tmdb.search_movie("Fight Club", 1999)
+        if test:
+            st.success(f"TMDB key works! Test search found: **{test['title']}** (ID {test['id']})")
+        else:
+            st.error(f"TMDB key accepted but search returned nothing. Last error: {tmdb.last_error}")
+            st.stop()
     except Exception as e:
-        st.error(f"TMDB connection error: {e}")
+        st.error(f"Failed to create TMDB client: {e}")
         st.stop()
 
+    # Enrich
     films = enrich_films(films, tmdb)
+
+    # Show how many got metadata
+    matched = [f for f in films if f.genres or f.directors]
+    st.write(f"**Films that received genres/directors:** {len(matched)} / {len(films)}")
+
+    if len(matched) == 0:
+        st.error("No films could be matched to TMDB. Recommendations cannot be generated.")
+        st.stop()
 
     with st.spinner("Analyzing your taste..."):
         prefs = analyze_preferences(films, min_rating=min_rating)
@@ -543,14 +540,14 @@ if run_button:
             for g, s in prefs["top_genres"]:
                 st.write(f"• {g} ({s:.1f})")
         else:
-            st.write("_Not enough data_")
+            st.write("_None found_")
 
         st.markdown("**Favorite Directors**")
         if prefs["top_directors"]:
             for d, s in prefs["top_directors"]:
                 st.write(f"• {d}")
         else:
-            st.write("_Not enough data_")
+            st.write("_None found_")
 
     with c2:
         st.markdown("**Favorite Actors**")
@@ -558,18 +555,13 @@ if run_button:
             for a, s in prefs["top_actors"][:8]:
                 st.write(f"• {a}")
         else:
-            st.write("_Not enough data_")
-
-        if prefs["overrated_by_user"]:
-            st.markdown("**Films you love more than the crowd**")
-            for f in prefs["overrated_by_user"][:5]:
-                st.write(f"• {f.title} ({f.year or '?'}) — you {f.user_rating}★")
+            st.write("_None found_")
 
     st.divider()
     st.subheader("Recommended Movies")
 
     if not recs:
-        st.info("No recommendations could be generated.")
+        st.warning("No recommendations could be generated.")
     else:
         table_data = []
         for i, r in enumerate(recs, 1):
@@ -586,7 +578,4 @@ if run_button:
         st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption(
-    "CSV format example: Title,Year,Rating → Parasite,2019,5\n\n"
-    "This tool uses public Letterboxd data + TMDB. Not affiliated with Letterboxd."
-)
+st.caption("Debug version – shows TMDB matching details")
