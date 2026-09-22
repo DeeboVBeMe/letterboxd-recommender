@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Letterboxd Movie Recommender — Streamlit Web Version (DEBUG)
-Shows detailed messages so we can see why TMDB matching fails.
+Letterboxd Movie Recommender — Streamlit Web Version (Fixed)
 """
 
 from __future__ import annotations
@@ -89,7 +88,33 @@ def load_from_csv(uploaded_file) -> list[RatedFilm]:
 
 
 # ---------------------------------------------------------------------------
-# TMDB client with better error reporting
+# Helper to safely turn tmdbv3api objects into plain data
+# ---------------------------------------------------------------------------
+
+def safe_get(obj, key, default=None):
+    """Safely get a value from either a dict or an object."""
+    try:
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+    except Exception:
+        return default
+
+
+def to_list(obj):
+    """Force something into a normal Python list."""
+    if obj is None:
+        return []
+    try:
+        return list(obj)
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# TMDB client
 # ---------------------------------------------------------------------------
 
 class TMDBClient:
@@ -111,26 +136,23 @@ class TMDBClient:
         if key in self._cache:
             return self._cache[key]
         try:
-            if year:
-                results = self.search.movies(title, year=year)
-            else:
-                results = self.search.movies(title)
-
+            results = self.search.movies(title, year=year) if year else self.search.movies(title)
+            results = to_list(results)
             if results:
                 best = results[0]
+                release = safe_get(best, "release_date")
                 data = {
-                    "id": best.id,
-                    "title": best.title,
-                    "year": int(best.release_date[:4]) if getattr(best, "release_date", None) else None,
-                    "vote_average": getattr(best, "vote_average", None),
-                    "overview": getattr(best, "overview", None),
+                    "id": safe_get(best, "id"),
+                    "title": safe_get(best, "title"),
+                    "year": int(release[:4]) if release else None,
+                    "vote_average": safe_get(best, "vote_average"),
+                    "overview": safe_get(best, "overview"),
                 }
                 self._cache[key] = data
                 return data
-            else:
-                self.last_error = f"No results for '{title}'"
-                self._cache[key] = None
-                return None
+            self.last_error = f"No results for '{title}'"
+            self._cache[key] = None
+            return None
         except Exception as e:
             self.last_error = str(e)
             self._cache[key] = None
@@ -143,38 +165,41 @@ class TMDBClient:
         try:
             m = self.movie.details(tmdb_id)
             credits = self.movie.credits(tmdb_id)
-            crew = credits.crew if hasattr(credits, "crew") else credits.get("crew", [])
-            cast = credits.cast if hasattr(credits, "cast") else credits.get("cast", [])
 
+            # --- Genres ---
+            genres = []
+            for g in to_list(safe_get(m, "genres")):
+                name = safe_get(g, "name")
+                if name:
+                    genres.append(name)
+
+            # --- Directors ---
             directors = []
+            crew = to_list(safe_get(credits, "crew"))
             for c in crew:
-                job = c.get("job") if isinstance(c, dict) else getattr(c, "job", None)
-                name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
-                if job == "Director" and name:
-                    directors.append(name)
+                if safe_get(c, "job") == "Director":
+                    name = safe_get(c, "name")
+                    if name:
+                        directors.append(name)
 
+            # --- Actors (top 8) ---
             actors = []
-            for c in (cast or [])[:8]:
-                name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
+            cast = to_list(safe_get(credits, "cast"))
+            for c in cast[:8]:
+                name = safe_get(c, "name")
                 if name:
                     actors.append(name)
 
-            genres = []
-            for g in (getattr(m, "genres", None) or []):
-                if isinstance(g, dict):
-                    genres.append(g["name"])
-                else:
-                    genres.append(g.name)
-
+            release = safe_get(m, "release_date")
             data = {
                 "id": tmdb_id,
-                "title": m.title,
-                "year": int(m.release_date[:4]) if m.release_date else None,
+                "title": safe_get(m, "title"),
+                "year": int(release[:4]) if release else None,
                 "genres": genres,
                 "directors": directors,
                 "actors": actors,
-                "vote_average": getattr(m, "vote_average", None),
-                "overview": getattr(m, "overview", None),
+                "vote_average": safe_get(m, "vote_average"),
+                "overview": safe_get(m, "overview"),
             }
             self._cache[key] = data
             return data
@@ -185,33 +210,35 @@ class TMDBClient:
 
     def get_similar(self, tmdb_id: int, limit: int = 7) -> list[dict]:
         try:
-            results = self.movie.similar(tmdb_id)
-            return [
-                {
-                    "id": r.id,
-                    "title": r.title,
-                    "year": int(r.release_date[:4]) if getattr(r, "release_date", None) else None,
-                    "vote_average": getattr(r, "vote_average", None),
-                    "overview": getattr(r, "overview", None),
-                }
-                for r in (results or [])[:limit]
-            ]
+            results = to_list(self.movie.similar(tmdb_id))
+            out = []
+            for r in results[:limit]:
+                release = safe_get(r, "release_date")
+                out.append({
+                    "id": safe_get(r, "id"),
+                    "title": safe_get(r, "title"),
+                    "year": int(release[:4]) if release else None,
+                    "vote_average": safe_get(r, "vote_average"),
+                    "overview": safe_get(r, "overview"),
+                })
+            return out
         except Exception:
             return []
 
     def get_recommendations(self, tmdb_id: int, limit: int = 5) -> list[dict]:
         try:
-            results = self.movie.recommendations(tmdb_id)
-            return [
-                {
-                    "id": r.id,
-                    "title": r.title,
-                    "year": int(r.release_date[:4]) if getattr(r, "release_date", None) else None,
-                    "vote_average": getattr(r, "vote_average", None),
-                    "overview": getattr(r, "overview", None),
-                }
-                for r in (results or [])[:limit]
-            ]
+            results = to_list(self.movie.recommendations(tmdb_id))
+            out = []
+            for r in results[:limit]:
+                release = safe_get(r, "release_date")
+                out.append({
+                    "id": safe_get(r, "id"),
+                    "title": safe_get(r, "title"),
+                    "year": int(release[:4]) if release else None,
+                    "vote_average": safe_get(r, "vote_average"),
+                    "overview": safe_get(r, "overview"),
+                })
+            return out
         except Exception:
             return []
 
@@ -223,17 +250,18 @@ class TMDBClient:
                 "vote_count.gte": 100,
                 "page": 1,
             }
-            results = self.discover.discover_movies(params)
-            return [
-                {
-                    "id": r.id,
-                    "title": r.title,
-                    "year": int(r.release_date[:4]) if getattr(r, "release_date", None) else None,
-                    "vote_average": getattr(r, "vote_average", None),
-                    "overview": getattr(r, "overview", None),
-                }
-                for r in (results or [])[:limit]
-            ]
+            results = to_list(self.discover.discover_movies(params))
+            out = []
+            for r in results[:limit]:
+                release = safe_get(r, "release_date")
+                out.append({
+                    "id": safe_get(r, "id"),
+                    "title": safe_get(r, "title"),
+                    "year": int(release[:4]) if release else None,
+                    "vote_average": safe_get(r, "vote_average"),
+                    "overview": safe_get(r, "overview"),
+                })
+            return out
         except Exception:
             return []
 
@@ -254,20 +282,18 @@ class TMDBClient:
 def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 40) -> list[RatedFilm]:
     ranked = sorted(films, key=lambda f: f.user_rating, reverse=True)[:max_enrich]
 
-    st.write("### 🔍 Debug: Looking up movies on TMDB")
+    st.write("### Looking up movies on TMDB...")
     progress = st.progress(0)
     status_text = st.empty()
-    debug_box = st.empty()
 
     success_count = 0
     fail_count = 0
-    debug_lines = []
 
     for i, film in enumerate(ranked):
-        status_text.text(f"Looking up: {film.title} ({film.year or '?'})")
+        status_text.text(f"Looking up: {film.title}")
         result = tmdb.search_movie(film.title, film.year)
 
-        if result:
+        if result and result.get("id"):
             film.tmdb_id = result["id"]
             details = tmdb.get_details(result["id"])
             if details:
@@ -277,23 +303,17 @@ def enrich_films(films: list[RatedFilm], tmdb: TMDBClient, max_enrich: int = 40)
                 if film.letterboxd_avg is None and details.get("vote_average"):
                     film.letterboxd_avg = round(details["vote_average"] / 2, 2)
                 success_count += 1
-                debug_lines.append(f"✅ **{film.title}** → matched as *{details.get('title')}* | Genres: {film.genres[:3]}")
             else:
                 fail_count += 1
-                debug_lines.append(f"⚠️ **{film.title}** → found ID {result['id']} but failed to get details. Error: {tmdb.last_error}")
         else:
             fail_count += 1
-            debug_lines.append(f"❌ **{film.title}** → no match. Error: {tmdb.last_error}")
 
         progress.progress((i + 1) / len(ranked))
-        # Show only the last 12 lines so the page doesn’t get too long
-        debug_box.markdown("\n\n".join(debug_lines[-12:]))
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     progress.empty()
     status_text.empty()
-
-    st.info(f"TMDB matching finished: **{success_count} succeeded**, **{fail_count} failed** out of {len(ranked)} films.")
+    st.info(f"Matched **{success_count}** films successfully ({fail_count} failed)")
     return films
 
 
@@ -384,30 +404,21 @@ def generate_recommendations(
 
     for dname, _ in prefs["top_directors"][:4]:
         try:
-            person_search = tmdb.search.people(dname)
+            person_search = to_list(tmdb.search.people(dname))
             if person_search:
-                pid = person_search[0].id
+                pid = safe_get(person_search[0], "id")
                 credits = tmdb.person_api.movie_credits(pid)
-                crew = credits.crew if hasattr(credits, "crew") else credits.get("crew", [])
-                directed = [
-                    c for c in crew
-                    if (c.get("job") if isinstance(c, dict) else getattr(c, "job", None)) == "Director"
-                ][:5]
+                crew = to_list(safe_get(credits, "crew"))
+                directed = [c for c in crew if safe_get(c, "job") == "Director"][:5]
                 for c in directed:
-                    if isinstance(c, dict):
-                        item = {
-                            "id": c.get("id"), "title": c.get("title"),
-                            "year": int(c["release_date"][:4]) if c.get("release_date") else None,
-                            "vote_average": c.get("vote_average"),
-                            "overview": c.get("overview"),
-                        }
-                    else:
-                        item = {
-                            "id": c.id, "title": c.title,
-                            "year": int(c.release_date[:4]) if getattr(c, "release_date", None) else None,
-                            "vote_average": getattr(c, "vote_average", None),
-                            "overview": getattr(c, "overview", None),
-                        }
+                    release = safe_get(c, "release_date")
+                    item = {
+                        "id": safe_get(c, "id"),
+                        "title": safe_get(c, "title"),
+                        "year": int(release[:4]) if release else None,
+                        "vote_average": safe_get(c, "vote_average"),
+                        "overview": safe_get(c, "overview"),
+                    }
                     add_candidate(item, 3.5, f"Directed by {dname}")
         except Exception:
             continue
@@ -426,14 +437,15 @@ def generate_recommendations(
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Letterboxd Movie Recommender (Debug)",
+    page_title="Letterboxd Movie Recommender",
     page_icon="🎬",
     layout="centered",
 )
 
-st.title("🎬 Letterboxd Movie Recommender (Debug Mode)")
+st.title("🎬 Letterboxd Movie Recommender")
 st.markdown(
-    "This version shows detailed messages so we can see why recommendations are empty."
+    "Analyze your Letterboxd ratings and get personalized movie recommendations.\n\n"
+    "**How to use:** Upload a CSV of your ratings + paste your TMDB API key, then click the button."
 )
 
 with st.sidebar:
@@ -447,21 +459,11 @@ with st.sidebar:
     min_rating = st.slider("Min rating for favorites", 3.0, 5.0, 4.0, 0.5)
 
 st.subheader("Your Ratings")
-col1, col2 = st.columns(2)
-
-with col1:
-    uploaded_file = st.file_uploader(
-        "Upload CSV (recommended)",
-        type=["csv"],
-        help="Must have columns: Title, Rating (Year optional)",
-    )
-
-with col2:
-    username = st.text_input(
-        "Or Letterboxd username",
-        placeholder="yourusername",
-        help="Often blocked on free cloud servers — CSV is more reliable",
-    )
+uploaded_file = st.file_uploader(
+    "Upload your ratings CSV",
+    type=["csv"],
+    help="Must have columns: Title, Rating (Year optional)",
+)
 
 run_button = st.button("Get Recommendations", type="primary", use_container_width=True)
 
@@ -470,52 +472,34 @@ if run_button:
         st.error("Please enter your TMDB API key.")
         st.stop()
 
-    films: list[RatedFilm] = []
+    if uploaded_file is None:
+        st.error("Please upload a CSV file.")
+        st.stop()
 
     with st.spinner("Loading your ratings..."):
-        if uploaded_file is not None:
-            try:
-                films = load_from_csv(uploaded_file)
-            except Exception as e:
-                st.error(f"Error reading CSV:\n{e}")
-                st.stop()
-        elif username and username.strip():
-            st.warning("Username scraping is often blocked. Prefer CSV.")
-            st.stop()
-        else:
-            st.error("Please upload a CSV.")
+        try:
+            films = load_from_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Error reading CSV:\n{e}")
             st.stop()
 
     if len(films) < 3:
         st.error(f"Only found {len(films)} rated films. Need at least 3.")
         st.stop()
 
-    st.success(f"Loaded **{len(films)}** rated films from CSV")
-    st.write("First few films loaded:", [f"{f.title} ({f.year}) – {f.user_rating}★" for f in films[:5]])
+    st.success(f"Loaded **{len(films)}** rated films")
 
-    # Test the API key quickly
-    st.write("### Testing TMDB connection...")
     try:
         tmdb = TMDBClient(tmdb_key.strip())
-        test = tmdb.search_movie("Fight Club", 1999)
-        if test:
-            st.success(f"TMDB key works! Test search found: **{test['title']}** (ID {test['id']})")
-        else:
-            st.error(f"TMDB key accepted but search returned nothing. Last error: {tmdb.last_error}")
-            st.stop()
     except Exception as e:
-        st.error(f"Failed to create TMDB client: {e}")
+        st.error(f"Failed to connect to TMDB: {e}")
         st.stop()
 
-    # Enrich
     films = enrich_films(films, tmdb)
 
-    # Show how many got metadata
     matched = [f for f in films if f.genres or f.directors]
-    st.write(f"**Films that received genres/directors:** {len(matched)} / {len(films)}")
-
     if len(matched) == 0:
-        st.error("No films could be matched to TMDB. Recommendations cannot be generated.")
+        st.error("No films could be matched to TMDB. Please check your API key and try again.")
         st.stop()
 
     with st.spinner("Analyzing your taste..."):
@@ -557,6 +541,11 @@ if run_button:
         else:
             st.write("_None found_")
 
+        if prefs["overrated_by_user"]:
+            st.markdown("**Films you love more than the crowd**")
+            for f in prefs["overrated_by_user"][:5]:
+                st.write(f"• {f.title} ({f.year or '?'}) — you {f.user_rating}★")
+
     st.divider()
     st.subheader("Recommended Movies")
 
@@ -578,4 +567,4 @@ if run_button:
         st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("Debug version – shows TMDB matching details")
+st.caption("Upload a CSV with columns Title, Year, Rating")
